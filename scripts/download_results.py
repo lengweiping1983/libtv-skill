@@ -17,7 +17,7 @@ from _common import query_session
 def extract_urls_from_messages(messages):
     """从会话消息中提取所有图片和视频结果 URL"""
     urls = []
-    url_pattern = re.compile(r'https://libtv-res\.liblib\.art/[^\s"\'<>]+\.(?:png|jpg|jpeg|webp|mp4|mov|webm)')
+    url_pattern = re.compile(r'https://libtv-res\.liblib\.art/[^\s"\'<>]+\.(?:png|jpg|jpeg|webp|mp4|mov|webm)(?:\?[^\s"\'<>]*)?')
 
     for msg in messages:
         content = msg.get("content", "")

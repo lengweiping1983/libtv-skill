@@ -114,6 +114,20 @@ python3 {baseDir}/scripts/download_results.py SESSION_ID --prefix "storyboard"
 python3 {baseDir}/scripts/download_results.py --urls URL1 URL2 URL3 --output-dir ./output
 ```
 
+### 6. 生成 3x3 面料看板（供 auto-garment-producer 调用）
+
+`scripts/generate_texture_collection_board.py` 是稳定的面料看板入口。它会创建/切换到新的 project，再创建新的 session 发送请求，只下载当前 session 返回的图片 URL，不扫描历史输出目录。
+
+```bash
+python3 {baseDir}/scripts/generate_texture_collection_board.py \
+  --prompt-file /path/to/libtv_collection_prompt.txt \
+  --output-dir /path/to/out/libtv_collection_board/run_xxx \
+  --output-format png \
+  --prefix collection_board
+```
+
+该入口只把近似正方形的图片视为合格 3x3 面料看板。`metadata.json` 中的 `download_succeeded` 只表示下载完成；只有 `succeeded` 才表示已选出合格看板。下游应读取 `selected_board_path`，不要默认使用第一张图片。若下载到了图片但没有合格 3x3，看作失败并记录 `no_valid_3x3_board`。
+
 ## 典型工作流
 
 理解这些工作流，才能正确组合上面的脚本完成用户需求。

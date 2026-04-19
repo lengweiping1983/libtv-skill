@@ -20,6 +20,14 @@ DEFAULT_PROMPT = """请生成一张 3x3 商业面料看板图片：九个协调�
 
 DEFAULT_NEGATIVE_PROMPT = """正面成衣效果图, 服装mockup, 模特上身图, 假人, 人物, 人脸, T恤产品图, 商品摄影, lookbook, poster, sticker sheet, text, labels, logo, watermark"""
 
+BOARD_VALIDATION_POLICY = {
+    "type": "near_square_3x3_board_v1",
+    "min_aspect_ratio": 0.92,
+    "max_aspect_ratio": 1.08,
+    "min_short_side_px": 512,
+    "selection": "largest_valid_area_then_earliest_return",
+}
+
 
 def read_text(path: str) -> str:
     return Path(path).read_text(encoding="utf-8").strip()
@@ -101,7 +109,12 @@ def _annotate_image_candidates(images: list[dict]) -> list[dict]:
             ratio = width / max(1, height)
             min_side = min(width, height)
             area = width * height
-            is_square = 0.92 <= ratio <= 1.08 and min_side >= 512
+            is_square = (
+                BOARD_VALIDATION_POLICY["min_aspect_ratio"]
+                <= ratio
+                <= BOARD_VALIDATION_POLICY["max_aspect_ratio"]
+                and min_side >= BOARD_VALIDATION_POLICY["min_short_side_px"]
+            )
             item.update({
                 "width": width,
                 "height": height,
@@ -164,7 +177,10 @@ def main() -> int:
         "images": [],
         "image_candidates": [],
         "downloaded_count": 0,
+        "ignored_url_count": 0,
+        "ignored_url_reasons": [],
         "valid_board": False,
+        "board_validation_policy": BOARD_VALIDATION_POLICY,
         "events": [],
     }
     write_metadata(output_dir, metadata)
@@ -182,26 +198,42 @@ def main() -> int:
         record_event(output_dir, metadata, "change_project_started", "创建/切换到新 libtv project")
         project_data = change_project()
         project_uuid = project_data.get("projectUuid", "")
+        if not project_uuid:
+            record_event(output_dir, metadata, "change_project_failed", "change_project 未返回 projectUuid", error_type="libtv_change_project_no_project_uuid")
+            print("Error: change_project did not return projectUuid.", file=sys.stderr)
+            return 1
         project_url = build_project_url(project_uuid)
-        metadata.update({"projectUuid": project_uuid, "projectUrl": project_url})
+        metadata.update({"projectUuid": project_uuid, "requestedProjectUuid": project_uuid, "projectUrl": project_url})
         record_event(output_dir, metadata, "change_project_succeeded", "已切换到新 project", project_uuid=project_uuid, project_url=project_url)
 
         record_event(output_dir, metadata, "create_session_started", "创建 libtv 会话并发送面料看板请求")
         session_data = create_session(session_id="", message=message)
         session_id = session_data.get("sessionId", "")
-        project_url = session_data.get("projectUrl", "") or project_url
-        metadata.update({"projectUuid": project_uuid, "sessionId": session_id, "projectUrl": project_url})
+        session_project_uuid = session_data.get("projectUuid", "") or project_uuid
+        project_url = session_data.get("projectUrl", "") or build_project_url(session_project_uuid)
+        metadata.update({"projectUuid": session_project_uuid, "requestedProjectUuid": project_uuid, "sessionId": session_id, "projectUrl": project_url})
+        if session_project_uuid != project_uuid:
+            record_event(
+                output_dir,
+                metadata,
+                "project_mismatch_warning",
+                "create_session 返回的 projectUuid 与刚切换的 projectUuid 不一致，保留 create_session 实际值",
+                requested_project_uuid=project_uuid,
+                actual_project_uuid=session_project_uuid,
+                project_url=project_url,
+            )
         if not session_id:
             record_event(output_dir, metadata, "create_session_failed", "create_session 未返回 sessionId")
             print("Error: create_session did not return sessionId.", file=sys.stderr)
             return 1
-        record_event(output_dir, metadata, "create_session_succeeded", "libtv 会话已创建", session_id=session_id, project_uuid=project_uuid, project_url=project_url)
+        record_event(output_dir, metadata, "create_session_succeeded", "libtv 会话已创建", session_id=session_id, project_uuid=session_project_uuid, requested_project_uuid=project_uuid, project_url=project_url)
 
         record_event(output_dir, metadata, "polling_started", "开始轮询 libtv 图片结果", session_id=session_id, project_uuid=project_uuid)
         started = time.time()
         after_seq = 0
         seen_urls: set[str] = set()
         images: list[dict] = []
+        ignored_url_reasons: list[dict] = []
         selected: dict | None = None
         while time.time() - started < args.timeout:
             time.sleep(max(1, args.poll_interval))
@@ -215,12 +247,27 @@ def main() -> int:
             image_urls = []
             for url in found:
                 if url in seen_urls:
+                    ignored_url_reasons.append({"url": url, "reason": "duplicate_url"})
                     continue
                 # This entrypoint only accepts image assets as 3x3 board candidates.
-                if not Path(url.split("?", 1)[0]).suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}:
+                suffix = Path(url.split("?", 1)[0]).suffix.lower()
+                if suffix in {".mp4", ".mov", ".webm"}:
+                    ignored_url_reasons.append({"url": url, "reason": "video_url_not_board_candidate"})
+                    seen_urls.add(url)
+                    continue
+                if suffix not in {".png", ".jpg", ".jpeg", ".webp"}:
+                    ignored_url_reasons.append({"url": url, "reason": f"unsupported_media_suffix:{suffix or 'none'}"})
+                    seen_urls.add(url)
                     continue
                 seen_urls.add(url)
                 image_urls.append(url)
+
+            if ignored_url_reasons:
+                metadata.update({
+                    "ignored_url_count": len(ignored_url_reasons),
+                    "ignored_url_reasons": ignored_url_reasons,
+                })
+                write_metadata(output_dir, metadata)
 
             if not image_urls:
                 continue
@@ -236,6 +283,8 @@ def main() -> int:
                 "images": images,
                 "image_candidates": candidates,
                 "downloaded_count": len(images),
+                "ignored_url_count": len(ignored_url_reasons),
+                "ignored_url_reasons": ignored_url_reasons,
                 "valid_board": bool(selected),
             })
             if selected:
@@ -275,6 +324,8 @@ def main() -> int:
                 "images": images,
                 "image_candidates": _annotate_image_candidates(images),
                 "downloaded_count": len(images),
+                "ignored_url_count": len(ignored_url_reasons),
+                "ignored_url_reasons": ignored_url_reasons,
             })
             write_metadata(output_dir, metadata)
             record_event(output_dir, metadata, "no_valid_3x3_board", f"已下载 {len(images)} 张图片，但没有合格 3x3 方形看板", error_type="libtv_no_valid_3x3_board", downloaded_count=len(images))
@@ -290,8 +341,13 @@ def main() -> int:
             "selected_board_path": selected.get("path", ""),
             "selected_board_url": selected.get("url", ""),
             "selected_board_index": selected.get("index"),
+            "downloaded_count": len(images),
+            "ignored_url_count": len(ignored_url_reasons),
+            "ignored_url_reasons": ignored_url_reasons,
+            "board_validation_policy": BOARD_VALIDATION_POLICY,
             "sessionId": session_id,
-            "projectUuid": project_uuid,
+            "projectUuid": session_project_uuid,
+            "requestedProjectUuid": project_uuid,
             "projectUrl": project_url,
             "metadata": str((output_dir / "metadata.json").resolve()),
         }, ensure_ascii=False, indent=2))
