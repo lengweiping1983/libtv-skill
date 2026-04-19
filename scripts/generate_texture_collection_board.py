@@ -59,9 +59,9 @@ def _file_ext_from_url(url: str, fallback: str) -> str:
     return f".{fallback.lstrip('.')}"
 
 
-def _download_urls(urls: list[str], output_dir: Path, prefix: str, output_format: str, download_file) -> list[dict]:
+def _download_urls(urls: list[str], output_dir: Path, prefix: str, output_format: str, download_file, start_index: int = 1) -> list[dict]:
     images = []
-    for index, url in enumerate(urls, 1):
+    for index, url in enumerate(urls, start_index):
         ext = _file_ext_from_url(url, output_format)
         path = output_dir / f"{prefix}_{index:02d}{ext}"
         saved_path, err = download_file(url, str(path))
@@ -69,6 +69,64 @@ def _download_urls(urls: list[str], output_dir: Path, prefix: str, output_format
             raise RuntimeError(f"下载失败: {url}: {err}")
         images.append({"filename": Path(saved_path).name, "path": str(Path(saved_path).resolve()), "url": url})
     return images
+
+
+def _image_dimensions(path: Path) -> tuple[int, int]:
+    """Read image dimensions without making Pillow a hard dependency."""
+    try:
+        from PIL import Image
+        with Image.open(path) as img:
+            return img.size
+    except ImportError:
+        pass
+
+    # Minimal PNG support for environments that only have the stdlib.
+    with path.open("rb") as f:
+        header = f.read(24)
+    if header.startswith(b"\x89PNG\r\n\x1a\n") and header[12:16] == b"IHDR":
+        width = int.from_bytes(header[16:20], "big")
+        height = int.from_bytes(header[20:24], "big")
+        return width, height
+    raise RuntimeError(f"无法读取图片尺寸: {path}")
+
+
+def _annotate_image_candidates(images: list[dict]) -> list[dict]:
+    candidates = []
+    for index, image in enumerate(images, 1):
+        item = dict(image)
+        item["index"] = index
+        path = Path(str(image.get("path", "")))
+        try:
+            width, height = _image_dimensions(path)
+            ratio = width / max(1, height)
+            min_side = min(width, height)
+            area = width * height
+            is_square = 0.92 <= ratio <= 1.08 and min_side >= 512
+            item.update({
+                "width": width,
+                "height": height,
+                "aspect_ratio": round(ratio, 4),
+                "area": area,
+                "is_square_candidate": is_square,
+                "validation_message": "ok" if is_square else (
+                    f"not_square_3x3_candidate: {width}x{height}, ratio={ratio:.3f}"
+                ),
+            })
+        except Exception as exc:
+            item.update({
+                "is_square_candidate": False,
+                "validation_message": f"dimension_read_failed: {exc}",
+            })
+        candidates.append(item)
+    return candidates
+
+
+def _select_board_candidate(candidates: list[dict]) -> dict | None:
+    valid = [item for item in candidates if item.get("is_square_candidate")]
+    if not valid:
+        return None
+    # Prefer the largest valid square board from this request.
+    return sorted(valid, key=lambda item: (item.get("area", 0), -item.get("index", 0)), reverse=True)[0]
 
 
 def main() -> int:
@@ -104,6 +162,9 @@ def main() -> int:
         "negative_prompt": args.negative_prompt,
         "output_format": args.output_format,
         "images": [],
+        "image_candidates": [],
+        "downloaded_count": 0,
+        "valid_board": False,
         "events": [],
     }
     write_metadata(output_dir, metadata)
@@ -139,7 +200,9 @@ def main() -> int:
         record_event(output_dir, metadata, "polling_started", "开始轮询 libtv 图片结果", session_id=session_id, project_uuid=project_uuid)
         started = time.time()
         after_seq = 0
-        image_urls: list[str] = []
+        seen_urls: set[str] = set()
+        images: list[dict] = []
+        selected: dict | None = None
         while time.time() - started < args.timeout:
             time.sleep(max(1, args.poll_interval))
             data = query_session(session_id, after_seq=after_seq)
@@ -149,28 +212,84 @@ def main() -> int:
                 if isinstance(seq, int):
                     after_seq = max(after_seq, seq)
             found = extract_urls_from_messages(messages)
-            if found:
-                seen = set()
-                image_urls = []
-                for url in found:
-                    if url not in seen:
-                        seen.add(url)
-                        image_urls.append(url)
-                record_event(output_dir, metadata, "result_detected", f"检测到 {len(image_urls)} 个图片 URL", result_url_count=len(image_urls), after_seq=after_seq)
+            image_urls = []
+            for url in found:
+                if url in seen_urls:
+                    continue
+                # This entrypoint only accepts image assets as 3x3 board candidates.
+                if not Path(url.split("?", 1)[0]).suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}:
+                    continue
+                seen_urls.add(url)
+                image_urls.append(url)
+
+            if not image_urls:
+                continue
+
+            record_event(output_dir, metadata, "result_detected", f"检测到 {len(image_urls)} 个新图片 URL", result_url_count=len(image_urls), after_seq=after_seq)
+            record_event(output_dir, metadata, "download_started", f"开始下载 {len(image_urls)} 个图片结果")
+            start_index = len(images) + 1
+            downloaded = _download_urls(image_urls, output_dir, args.prefix, args.output_format, download_file, start_index=start_index)
+            images.extend(downloaded)
+            candidates = _annotate_image_candidates(images)
+            selected = _select_board_candidate(candidates)
+            metadata.update({
+                "images": images,
+                "image_candidates": candidates,
+                "downloaded_count": len(images),
+                "valid_board": bool(selected),
+            })
+            if selected:
+                metadata.update({
+                    "selected_board_path": selected.get("path", ""),
+                    "selected_board_url": selected.get("url", ""),
+                    "selected_board_index": selected.get("index"),
+                })
+            write_metadata(output_dir, metadata)
+            record_event(output_dir, metadata, "download_succeeded", f"已下载 {len(images)} 个当前会话图片结果", downloaded_count=len(images))
+
+            if selected:
+                record_event(
+                    output_dir,
+                    metadata,
+                    "board_candidate_selected",
+                    "已选出合格 3x3 面料看板",
+                    output_path=selected.get("path", ""),
+                    selected_board_index=selected.get("index"),
+                    selected_board_url=selected.get("url", ""),
+                    width=selected.get("width"),
+                    height=selected.get("height"),
+                    aspect_ratio=selected.get("aspect_ratio"),
+                )
                 break
 
-        if not image_urls:
+            record_event(output_dir, metadata, "no_valid_3x3_candidate_yet", "当前批次没有合格 3x3 方形看板，继续轮询", downloaded_count=len(images), after_seq=after_seq)
+
+        if not images:
             record_event(output_dir, metadata, "poll_timeout", f"轮询超时（{args.timeout}s），未检测到图片结果", error_type="libtv_no_image_result", after_seq=after_seq)
             print(f"Error: polling timed out after {args.timeout}s without image result.", file=sys.stderr)
             return 1
 
-        record_event(output_dir, metadata, "download_started", f"开始下载 {len(image_urls)} 个图片结果")
-        images = _download_urls(image_urls, output_dir, args.prefix, args.output_format, download_file)
-        metadata["images"] = images
-        record_event(output_dir, metadata, "succeeded", "libtv 面料看板已生成并下载", output_path=images[0]["path"], downloaded_count=len(images))
+        if not selected:
+            metadata.update({
+                "valid_board": False,
+                "images": images,
+                "image_candidates": _annotate_image_candidates(images),
+                "downloaded_count": len(images),
+            })
+            write_metadata(output_dir, metadata)
+            record_event(output_dir, metadata, "no_valid_3x3_board", f"已下载 {len(images)} 张图片，但没有合格 3x3 方形看板", error_type="libtv_no_valid_3x3_board", downloaded_count=len(images))
+            print(f"Error: downloaded {len(images)} image(s), but no valid square 3x3 board was found.", file=sys.stderr)
+            return 1
+
+        record_event(output_dir, metadata, "succeeded", "libtv 面料看板已生成、下载并通过 3x3 校验", output_path=selected["path"], downloaded_count=len(images))
         print(json.dumps({
             "output_dir": str(output_dir.resolve()),
             "images": images,
+            "image_candidates": metadata.get("image_candidates", []),
+            "valid_board": True,
+            "selected_board_path": selected.get("path", ""),
+            "selected_board_url": selected.get("url", ""),
+            "selected_board_index": selected.get("index"),
             "sessionId": session_id,
             "projectUuid": project_uuid,
             "projectUrl": project_url,
