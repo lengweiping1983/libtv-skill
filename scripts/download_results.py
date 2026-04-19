@@ -2,73 +2,170 @@
 """下载生成结果：从会话中提取所有图片/视频 URL 并批量下载到本地"""
 
 import argparse
+import html
 import json
 import os
 import re
 import sys
+import time
 import urllib.request
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(__file__))
 from _common import query_session
 
 
+URL_PATTERN = re.compile(r"https?://[^\s\"'<>\\\])}，。；、]+")
+MEDIA_EXT_PATTERN = re.compile(r"\.(?:png|jpg|jpeg|webp|gif|mp4|mov|webm)(?:\?|$)", re.IGNORECASE)
+RESULT_URL_KEYS = {
+    "url",
+    "urls",
+    "uri",
+    "src",
+    "href",
+    "path",
+    "preview",
+    "preview_path",
+    "previewPath",
+    "image",
+    "images",
+    "image_url",
+    "imageUrl",
+    "image_urls",
+    "imageUrls",
+    "output",
+    "outputs",
+    "result",
+    "results",
+    "video",
+    "videos",
+    "video_url",
+    "videoUrl",
+}
+
+
+def _clean_url(url: str) -> str:
+    url = html.unescape(str(url)).strip()
+    url = url.replace("\\/", "/")
+    url = url.rstrip(".,;:!?，。；、")
+    return url
+
+
+def _looks_like_result_url(url: str) -> bool:
+    lower = url.lower()
+    if MEDIA_EXT_PATTERN.search(lower):
+        return True
+    return any(
+        marker in lower
+        for marker in (
+            "libtv-res",
+            "liblib.art",
+            "liblibai-online",
+            "aliyuncs",
+            "cos.",
+            "oss-",
+            "oss.",
+            "cdn.",
+            "image",
+            "img",
+            "video",
+            "media",
+            "preview",
+            "result",
+        )
+    )
+
+
+def _maybe_parse_json(value):
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if not text or text[0] not in "[{":
+        return value
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return value
+
+
+def _collect_urls(value, urls: list[str], *, key_hint: str = "") -> None:
+    value = _maybe_parse_json(value)
+    if isinstance(value, dict):
+        for key, item in value.items():
+            _collect_urls(item, urls, key_hint=str(key))
+        return
+    if isinstance(value, list):
+        for item in value:
+            _collect_urls(item, urls, key_hint=key_hint)
+        return
+    if not isinstance(value, str):
+        return
+
+    text = html.unescape(value).replace("\\/", "/")
+    direct = _clean_url(text)
+    if direct.startswith(("http://", "https://")) and (
+        key_hint in RESULT_URL_KEYS or _looks_like_result_url(direct)
+    ):
+        urls.append(direct)
+    for match in URL_PATTERN.findall(text):
+        url = _clean_url(match)
+        if _looks_like_result_url(url):
+            urls.append(url)
+
+
 def extract_urls_from_messages(messages):
-    """从会话消息中提取所有图片和视频结果 URL"""
+    """从会话消息中递归提取图片/视频结果 URL，兼容 tool JSON、assistant 文本和嵌套字段。"""
     urls = []
-    url_pattern = re.compile(r'https://libtv-res\.liblib\.art/[^\s"\'<>]+\.(?:png|jpg|jpeg|webp|mp4|mov|webm)(?:\?[^\s"\'<>]*)?')
+    for msg in messages or []:
+        _collect_urls(msg, urls)
 
-    for msg in messages:
-        content = msg.get("content", "")
-        if not content or not isinstance(content, str):
-            continue
-
-        # 从 task_result 中提取（toolmsg 返回的结果）
-        if msg.get("role") == "tool":
-            try:
-                data = json.loads(content)
-                task_result = data.get("task_result", {})
-                for img in task_result.get("images", []):
-                    preview = img.get("previewPath", "")
-                    if preview:
-                        urls.append(preview)
-                for vid in task_result.get("videos", []):
-                    preview = vid.get("previewPath", vid.get("url", ""))
-                    if preview:
-                        urls.append(preview)
-            except (json.JSONDecodeError, AttributeError):
-                pass
-
-        # 从 assistant 文本消息中提取 URL
-        if msg.get("role") == "assistant":
-            found = url_pattern.findall(content)
-            urls.extend(found)
-
-    # 去重保序
     seen = set()
     unique = []
-    for u in urls:
-        if u not in seen:
-            seen.add(u)
-            unique.append(u)
+    for url in urls:
+        if url not in seen:
+            seen.add(url)
+            unique.append(url)
     return unique
 
 
 def download_file(url, filepath):
     """下载单个文件"""
-    req = urllib.request.Request(url, headers={"User-Agent": "LibTV-Skill/1.0"})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            with open(filepath, "wb") as f:
-                while True:
-                    chunk = resp.read(8192)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-        return filepath, None
-    except Exception as e:
-        return filepath, str(e)
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "LibTV-Skill/1.0",
+            "Accept": "image/*,video/*,*/*;q=0.8",
+        },
+    )
+    Path(filepath).parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = f"{filepath}.part"
+    last_error = ""
+    for attempt in range(1, 4):
+        try:
+            with urllib.request.urlopen(req, timeout=90) as resp:
+                status = getattr(resp, "status", 200)
+                if status and status >= 400:
+                    raise urllib.error.HTTPError(url, status, f"HTTP {status}", resp.headers, None)
+                with open(tmp_path, "wb") as f:
+                    while True:
+                        chunk = resp.read(1024 * 64)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+            os.replace(tmp_path, filepath)
+            return filepath, None
+        except Exception as e:
+            last_error = str(e)
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
+            if attempt < 3:
+                time.sleep(1.5 * attempt)
+    return filepath, last_error
 
 
 def main():

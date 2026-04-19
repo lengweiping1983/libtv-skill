@@ -13,6 +13,7 @@ import json
 import os
 import sys
 import time
+import urllib.parse
 from pathlib import Path
 
 
@@ -61,10 +62,24 @@ def _load_libtv_modules(access_key: str):
 
 
 def _file_ext_from_url(url: str, fallback: str) -> str:
-    suffix = Path(url.split("?", 1)[0]).suffix.lower()
+    parsed = urllib.parse.urlparse(url)
+    suffix = Path(urllib.parse.unquote(parsed.path)).suffix.lower()
+    if not suffix:
+        query = urllib.parse.parse_qs(parsed.query)
+        for key in ("format", "ext", "type"):
+            values = query.get(key) or []
+            if values:
+                candidate = "." + values[0].lower().lstrip(".")
+                if candidate in {".png", ".jpg", ".jpeg", ".webp"}:
+                    return candidate
     if suffix in {".png", ".jpg", ".jpeg", ".webp"}:
         return suffix
     return f".{fallback.lstrip('.')}"
+
+
+def _media_suffix_from_url(url: str) -> str:
+    parsed = urllib.parse.urlparse(url)
+    return Path(urllib.parse.unquote(parsed.path)).suffix.lower()
 
 
 def _download_urls(urls: list[str], output_dir: Path, prefix: str, output_format: str, download_file, start_index: int = 1) -> list[dict]:
@@ -191,7 +206,9 @@ def main() -> int:
         message = (
             f"{args.prompt}\n\n"
             f"硬性反向约束：{args.negative_prompt}\n\n"
-            "输出要求：只返回一张正方形 3x3 面料九宫格看板图片；不要生成正面成衣效果图、模特图、假人图或商品照片。"
+            "执行方式：请直接调用文生图/图片生成模型生成单张图片，不要生成视频、不要进入多轮创作、不要只给文字说明。\n"
+            "输出要求：只返回一张正方形 1:1 的 3x3 面料九宫格看板图片；九个面板必须在同一张图里，白色细间隔。"
+            "不要生成正面成衣效果图、模特图、假人图或商品照片。完成后请在回复或工具结果中提供最终图片 URL。"
         )
 
         # 先切换到新项目，确保本次任务完全隔离历史
@@ -231,18 +248,27 @@ def main() -> int:
         record_event(output_dir, metadata, "polling_started", "开始轮询 libtv 图片结果", session_id=session_id, project_uuid=project_uuid)
         started = time.time()
         after_seq = 0
+        max_seen_seq = 0
+        poll_count = 0
         seen_urls: set[str] = set()
         images: list[dict] = []
         ignored_url_reasons: list[dict] = []
         selected: dict | None = None
         while time.time() - started < args.timeout:
             time.sleep(max(1, args.poll_interval))
-            data = query_session(session_id, after_seq=after_seq)
+            poll_count += 1
+            # libtv messages can be updated in place as a tool task progresses.
+            # Querying the full session each time avoids missing a final URL that
+            # lands on an already-seen message seq.
+            data = query_session(session_id, after_seq=0)
             messages = data.get("messages", [])
             for msg in messages:
                 seq = msg.get("seq", msg.get("sequence", 0))
+                if isinstance(seq, str) and seq.isdigit():
+                    seq = int(seq)
                 if isinstance(seq, int):
-                    after_seq = max(after_seq, seq)
+                    max_seen_seq = max(max_seen_seq, seq)
+                    after_seq = max_seen_seq
             found = extract_urls_from_messages(messages)
             image_urls = []
             for url in found:
@@ -250,22 +276,25 @@ def main() -> int:
                     ignored_url_reasons.append({"url": url, "reason": "duplicate_url"})
                     continue
                 # This entrypoint only accepts image assets as 3x3 board candidates.
-                suffix = Path(url.split("?", 1)[0]).suffix.lower()
+                suffix = _media_suffix_from_url(url)
                 if suffix in {".mp4", ".mov", ".webm"}:
                     ignored_url_reasons.append({"url": url, "reason": "video_url_not_board_candidate"})
                     seen_urls.add(url)
                     continue
-                if suffix not in {".png", ".jpg", ".jpeg", ".webp"}:
-                    ignored_url_reasons.append({"url": url, "reason": f"unsupported_media_suffix:{suffix or 'none'}"})
-                    seen_urls.add(url)
-                    continue
+                # Some signed object URLs omit a conventional image extension.
+                # Download them with the requested fallback format and let the
+                # dimension reader decide whether the payload is a real image.
                 seen_urls.add(url)
                 image_urls.append(url)
 
-            if ignored_url_reasons:
+            if ignored_url_reasons or poll_count == 1 or poll_count % 5 == 0:
                 metadata.update({
                     "ignored_url_count": len(ignored_url_reasons),
                     "ignored_url_reasons": ignored_url_reasons,
+                    "poll_count": poll_count,
+                    "last_message_count": len(messages),
+                    "last_found_url_count": len(found),
+                    "last_seen_seq": max_seen_seq,
                 })
                 write_metadata(output_dir, metadata)
 
