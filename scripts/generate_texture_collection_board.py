@@ -47,9 +47,9 @@ def _load_libtv_modules(access_key: str):
         os.environ["LIBTV_ACCESS_KEY"] = access_key
     script_dir = Path(__file__).resolve().parent
     sys.path.insert(0, str(script_dir))
-    from _common import build_project_url, create_session, query_session
+    from _common import build_project_url, change_project, create_session, query_session
     from download_results import download_file, extract_urls_from_messages
-    return build_project_url, create_session, query_session, download_file, extract_urls_from_messages
+    return build_project_url, change_project, create_session, query_session, download_file, extract_urls_from_messages
 
 
 def _file_ext_from_url(url: str, fallback: str) -> str:
@@ -109,7 +109,7 @@ def main() -> int:
     write_metadata(output_dir, metadata)
 
     try:
-        build_project_url, create_session, query_session, download_file, extract_urls_from_messages = _load_libtv_modules(access_key)
+        build_project_url, change_project, create_session, query_session, download_file, extract_urls_from_messages = _load_libtv_modules(access_key)
 
         message = (
             f"{args.prompt}\n\n"
@@ -117,11 +117,18 @@ def main() -> int:
             "输出要求：只返回一张正方形 3x3 面料九宫格看板图片；不要生成正面成衣效果图、模特图、假人图或商品照片。"
         )
 
+        # 先切换到新项目，确保本次任务完全隔离历史
+        record_event(output_dir, metadata, "change_project_started", "创建/切换到新 libtv project")
+        project_data = change_project()
+        project_uuid = project_data.get("projectUuid", "")
+        project_url = build_project_url(project_uuid)
+        metadata.update({"projectUuid": project_uuid, "projectUrl": project_url})
+        record_event(output_dir, metadata, "change_project_succeeded", "已切换到新 project", project_uuid=project_uuid, project_url=project_url)
+
         record_event(output_dir, metadata, "create_session_started", "创建 libtv 会话并发送面料看板请求")
         session_data = create_session(session_id="", message=message)
-        project_uuid = session_data.get("projectUuid", "")
         session_id = session_data.get("sessionId", "")
-        project_url = session_data.get("projectUrl", "") or build_project_url(project_uuid)
+        project_url = session_data.get("projectUrl", "") or project_url
         metadata.update({"projectUuid": project_uuid, "sessionId": session_id, "projectUrl": project_url})
         if not session_id:
             record_event(output_dir, metadata, "create_session_failed", "create_session 未返回 sessionId")

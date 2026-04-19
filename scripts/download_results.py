@@ -95,12 +95,13 @@ def main():
     parser.add_argument("--output-dir", default="", help="输出目录（默认 ~/Downloads/libtv_results/）")
     parser.add_argument("--prefix", default="", help="文件名前缀（如 'storyboard' → storyboard_01.png）")
     parser.add_argument("--workers", type=int, default=5, help="并行下载线程数（默认 5）")
+    parser.add_argument("--after-seq", type=int, default=0, help="只拉取 seq 大于此值的消息（增量模式）。默认 0 表示拉取全部。")
     args = parser.parse_args()
 
     # 收集 URL
     urls = list(args.urls)
     if args.session_id:
-        data = query_session(args.session_id)
+        data = query_session(args.session_id, after_seq=args.after_seq)
         messages = data.get("messages", [])
         extracted = extract_urls_from_messages(messages)
         urls.extend(extracted)
